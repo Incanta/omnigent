@@ -55,6 +55,7 @@ class HostFrameKind(str, Enum):
     LIST_WORKTREES_RESULT = "host.list_worktrees_result"
     CREATE_DIR = "host.create_dir"
     CREATE_DIR_RESULT = "host.create_dir_result"
+    READINESS = "host.readiness"
 
 
 # ── Frame dataclasses ────────────────────────────────────
@@ -197,6 +198,27 @@ class HostRunnerExitedFrame:
 
     runner_id: str
     error: str
+
+
+@dataclass
+class HostReadinessFrame:
+    """Host → server: a refreshed per-harness readiness map.
+
+    One-way report (no result frame). :class:`HostHelloFrame` carries
+    readiness only at connect, so a daemon that connected before a CLI
+    was on its ``PATH`` (e.g. before ``nvm`` populated it) would report
+    that harness not-ready for the life of the connection — and the
+    new-session picker would keep a genuinely-working provider hidden.
+    The daemon re-probes readiness periodically and sends this frame
+    whenever the map changes, so the server's view (and the picker) heals
+    without a reconnect.
+
+    :param configured_harnesses: Same shape as
+        :attr:`HostHelloFrame.configured_harnesses`, e.g.
+        ``{"claude-native": True, "codex-native": "binary-missing"}``.
+    """
+
+    configured_harnesses: dict[str, HarnessAvailability] | None = None
 
 
 @dataclass
@@ -525,6 +547,7 @@ HostFrame = (
     | HostStopRunnerFrame
     | HostStopRunnerResultFrame
     | HostRunnerExitedFrame
+    | HostReadinessFrame
     | HostStatFrame
     | HostStatResultFrame
     | HostListDirFrame
@@ -630,6 +653,13 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "kind": HostFrameKind.RUNNER_EXITED.value,
                 "runner_id": frame.runner_id,
                 "error": frame.error,
+            }
+        )
+    if isinstance(frame, HostReadinessFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.READINESS.value,
+                "configured_harnesses": frame.configured_harnesses,
             }
         )
     if isinstance(frame, HostStatFrame):
@@ -855,7 +885,20 @@ def _decode_known_host_frame(
             return _decode_create_dir(msg)
         case HostFrameKind.CREATE_DIR_RESULT:
             return _decode_create_dir_result(msg)
+        case HostFrameKind.READINESS:
+            return _decode_readiness(msg)
     raise ValueError(f"unhandled host frame kind: {kind.value!r}")  # pragma: no cover
+
+
+def _decode_readiness(msg: dict[str, Any]) -> HostReadinessFrame:
+    """Decode a host readiness frame.
+
+    :param msg: Decoded frame object.
+    :returns: Typed host readiness frame.
+    """
+    return HostReadinessFrame(
+        configured_harnesses=_optional_str_availability_map(msg, "configured_harnesses"),
+    )
 
 
 def _decode_host_hello(msg: dict[str, Any]) -> HostHelloFrame:

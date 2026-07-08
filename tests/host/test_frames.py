@@ -20,6 +20,7 @@ from omnigent.host.frames import (
     HostListDirResultFrame,
     HostListWorktreesFrame,
     HostListWorktreesResultFrame,
+    HostReadinessFrame,
     HostRemoveWorktreeFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
@@ -374,6 +375,35 @@ def test_runner_exited_frame_round_trip() -> None:
     assert decoded.runner_id == "runner_abc123"
     # The multi-line error (including the log tail) must survive intact.
     assert decoded.error == original.error
+
+
+def test_readiness_frame_round_trip() -> None:
+    """
+    Verify HostReadinessFrame survives encode → decode with exact values.
+
+    This one-way frame heals a stale connect-time readiness map: a lossy
+    round-trip would persist the wrong readiness and the picker would keep
+    a now-ready provider hidden (or hide a newly-unready one incorrectly).
+    """
+    original = HostReadinessFrame(
+        configured_harnesses={"claude-native": True, "codex-native": "binary-missing"},
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostReadinessFrame)
+    assert decoded.configured_harnesses == {
+        "claude-native": True,
+        "codex-native": "binary-missing",
+    }
+
+
+def test_readiness_frame_missing_map_decodes_as_none() -> None:
+    """
+    Verify a readiness frame without ``configured_harnesses`` decodes with
+    the field as None — "unknown", never a dict — mirroring the hello frame.
+    """
+    decoded = decode_host_frame('{"kind": "host.readiness"}')
+    assert isinstance(decoded, HostReadinessFrame)
+    assert decoded.configured_harnesses is None
 
 
 def test_runner_exited_frame_missing_error_raises() -> None:
