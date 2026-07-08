@@ -32,6 +32,7 @@ from omnigent.host.frames import (
     HostLaunchRunnerResultFrame,
     HostListDirResultFrame,
     HostListWorktreesResultFrame,
+    HostReadinessFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
     HostStatResultFrame,
@@ -255,7 +256,9 @@ def create_host_tunnel_router(
                 name=f"host-ping:{host_id}",
             )
             receive_task = asyncio.create_task(
-                _receive_loop(ws, conn, host_id, runner_exit_reports, on_runner_exited),
+                _receive_loop(
+                    ws, conn, host_id, runner_exit_reports, on_runner_exited, host_store
+                ),
                 name=f"host-receive:{host_id}",
             )
 
@@ -373,6 +376,7 @@ async def _receive_loop(
     host_id: str,
     runner_exit_reports: RunnerExitReports | None,
     on_runner_exited: Callable[[str, str], Awaitable[None]] | None,
+    host_store: HostStore,
 ) -> None:
     """Receive host frames and route results to pending futures.
 
@@ -383,6 +387,8 @@ async def _receive_loop(
         reports; ``None`` drops them.
     :param on_runner_exited: Callback fired with ``(runner_id, error)``
         when a ``host.runner_exited`` frame arrives; ``None`` skips it.
+    :param host_store: Persistent host store, used to refresh a host's
+        readiness map from a ``host.readiness`` frame.
     """
     while True:
         message = await ws.receive()
@@ -469,6 +475,18 @@ async def _receive_loop(
                 # connecting its tunnel has no runner-tunnel disconnect
                 # event, so this report is the only failure signal.
                 await on_runner_exited(frame.runner_id, frame.error)
+            continue
+
+        if isinstance(frame, HostReadinessFrame):
+            # The daemon re-probed its harness readiness (a CLI appeared on
+            # PATH since connect) and reports the fresh map. Persist it so the
+            # new-session picker stops hiding a now-ready provider without
+            # waiting for a reconnect.
+            await asyncio.to_thread(
+                host_store.update_configured_harnesses,
+                host_id,
+                frame.configured_harnesses,
+            )
             continue
 
         if isinstance(frame, HostStatResultFrame):

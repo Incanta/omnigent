@@ -162,6 +162,53 @@ def test_upsert_reconnect_overwrites_and_nulls_configured_harnesses(
     assert fetched.configured_harnesses is None
 
 
+def test_update_configured_harnesses_refreshes_map_in_place(host_store: HostStore) -> None:
+    """
+    Verify update_configured_harnesses refreshes only the readiness map of a
+    connected host, leaving owner/name/status untouched.
+
+    This is the mid-connection self-heal: a daemon that connected before a CLI
+    was on PATH re-probes and pushes a fresh map, so the picker stops hiding a
+    now-ready provider without a reconnect.
+    """
+    host_store.upsert_on_connect(
+        host_id="host_up1",
+        name="laptop",
+        owner="alice@example.com",
+        configured_harnesses={"claude-native": False},
+    )
+
+    updated = host_store.update_configured_harnesses(
+        "host_up1", {"claude-native": True, "codex-native": "binary-missing"}
+    )
+    assert updated is not None
+    assert updated.configured_harnesses == {
+        "claude-native": True,
+        "codex-native": "binary-missing",
+    }
+    # Ownership / name / liveness are not disturbed by a readiness refresh.
+    assert updated.owner == "alice@example.com"
+    assert updated.name == "laptop"
+    assert updated.status == "online"
+
+    fetched = host_store.get_host("host_up1")
+    assert fetched is not None
+    assert fetched.configured_harnesses == {
+        "claude-native": True,
+        "codex-native": "binary-missing",
+    }
+
+
+def test_update_configured_harnesses_absent_host_is_noop(host_store: HostStore) -> None:
+    """
+    Verify updating readiness for an unknown host_id returns None and inserts
+    nothing — a readiness frame that races host removal is dropped, not
+    resurrected as a partial row.
+    """
+    assert host_store.update_configured_harnesses("host_missing", {"claude-native": True}) is None
+    assert host_store.get_host("host_missing") is None
+
+
 def test_malformed_configured_harnesses_column_reads_as_none(
     host_store: HostStore,
     db_uri: str,

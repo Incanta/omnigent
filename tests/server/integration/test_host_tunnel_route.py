@@ -15,6 +15,7 @@ from omnigent.db.utils import get_or_create_engine, now_epoch
 from omnigent.host.frames import (
     HostHelloFrame,
     HostLaunchRunnerResultFrame,
+    HostReadinessFrame,
     encode_host_frame,
 )
 from omnigent.server.auth import AuthProvider
@@ -302,6 +303,48 @@ async def test_host_tunnel_upserts_db_on_connect(
     assert host is not None, "Host row should exist in DB after tunnel connect"
     assert host.name == "test-laptop"
     assert host.status == "online"
+
+
+async def test_host_tunnel_readiness_frame_refreshes_map(
+    host_app: tuple[FastAPI, HostRegistry, HostStore],
+) -> None:
+    """
+    Verify a mid-connection ``host.readiness`` frame updates the stored map.
+
+    This is the self-heal path: a daemon that connected before a CLI was on
+    PATH (map says a harness not-ready) re-probes and pushes a fresh frame, so
+    the new-session picker stops hiding a now-ready provider without a
+    reconnect. If the receive loop drops the frame, the map never heals.
+    """
+    app, registry, store = host_app
+    comm = await _connect_route(app, _TUNNEL_PATH)
+    await _send_hello_and_wait(comm, registry)
+
+    await comm.send_input(
+        {
+            "type": "websocket.receive",
+            "text": encode_host_frame(
+                HostReadinessFrame(
+                    configured_harnesses={
+                        "claude-native": True,
+                        "codex-native": "binary-missing",
+                    }
+                )
+            ),
+        },
+    )
+
+    async def _wait_map() -> None:
+        while True:
+            host = store.get_host(_HOST_ID)
+            if host is not None and host.configured_harnesses == {
+                "claude-native": True,
+                "codex-native": "binary-missing",
+            }:
+                return
+            await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(_wait_map(), timeout=2.0)
 
 
 async def test_host_tunnel_sets_offline_on_disconnect(

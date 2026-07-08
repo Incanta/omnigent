@@ -38,6 +38,7 @@ from omnigent.host.frames import (
     HostListDirResultFrame,
     HostListWorktreesFrame,
     HostListWorktreesResultFrame,
+    HostReadinessFrame,
     HostRemoveWorktreeFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
@@ -57,6 +58,7 @@ from omnigent.host.git_worktree import (
 from omnigent.host.identity import HostIdentity, load_or_create_host_identity
 from omnigent.onboarding.harness_install import harness_setup_hint
 from omnigent.onboarding.harness_readiness import (
+    HarnessAvailability,
     configured_harness_map,
     harness_is_configured,
 )
@@ -134,6 +136,13 @@ _RUNNER_WATCH_INTERVAL_S = 0.5
 # ~900 zombies and OOM'd the box (#1782). A ``WNOHANG`` sweep is a cheap
 # syscall, so 2s keeps zombie lifetime short at negligible cost.
 _ORPHAN_REAP_INTERVAL_S = 2.0
+
+# How often the daemon re-probes harness readiness while connected and, if it
+# changed since last reported, pushes a fresh ``host.readiness`` frame. Heals a
+# map captured at connect before a CLI was on PATH (e.g. before nvm loaded), so
+# the picker stops hiding a now-ready provider without waiting for a reconnect.
+# A plain re-``shutil.which`` sweep off the event loop; cheap at this cadence.
+_READINESS_REPROBE_INTERVAL_S = 60.0
 
 
 def _install_child_subreaper() -> bool:
@@ -1826,13 +1835,55 @@ class HostProcess:
             flush=True,
         )
 
+        # Re-probe readiness periodically for the life of this connection and
+        # push a fresh map on change, so a stale connect-time map self-heals.
+        readiness_task = asyncio.create_task(
+            self._readiness_refresh_loop(ws, hello.configured_harnesses)
+        )
+        try:
+            while True:
+                try:
+                    raw = await asyncio.wait_for(ws.recv(), timeout=60.0)
+                except asyncio.TimeoutError:
+                    continue
+                if isinstance(raw, str):
+                    await self._handle_raw_message(ws, raw)
+        finally:
+            readiness_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await readiness_task
+
+    async def _readiness_refresh_loop(
+        self,
+        ws: websockets.asyncio.client.ClientConnection,
+        initial: dict[str, HarnessAvailability] | None,
+    ) -> None:
+        """Push a fresh ``host.readiness`` frame whenever readiness changes.
+
+        The hello frame reports readiness only at connect, so a daemon that
+        connected before a CLI landed on ``PATH`` would keep reporting that
+        harness not-ready — and the picker would keep it hidden — until a
+        reconnect. This loop re-probes on an interval and sends the map only
+        when it differs from what was last reported, healing the server's view
+        in place. Send failures are swallowed: the reconnect path re-sends the
+        current map in its hello, so a transient failure is self-correcting.
+
+        :param ws: The open tunnel connection.
+        :param initial: The map already sent in the hello frame — the baseline
+            the first re-probe is compared against.
+        :returns: None. Runs until cancelled when the connection ends.
+        """
+        last = initial
         while True:
-            try:
-                raw = await asyncio.wait_for(ws.recv(), timeout=60.0)
-            except asyncio.TimeoutError:
+            await asyncio.sleep(_READINESS_REPROBE_INTERVAL_S)
+            current = await asyncio.to_thread(configured_harness_map)
+            if current == last:
                 continue
-            if isinstance(raw, str):
-                await self._handle_raw_message(ws, raw)
+            last = current
+            try:
+                await ws.send(encode_host_frame(HostReadinessFrame(configured_harnesses=current)))
+            except Exception:  # noqa: BLE001 — reconnect re-sends readiness in its hello
+                _logger.debug("Could not send host.readiness update", exc_info=True)
 
     async def _handle_raw_message(
         self, ws: websockets.asyncio.client.ClientConnection, raw: str

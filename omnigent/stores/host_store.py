@@ -301,6 +301,36 @@ class HostStore:
             session.add(row)
             return _row_to_host(row)
 
+    def update_configured_harnesses(
+        self,
+        host_id: str,
+        configured_harnesses: dict[str, HarnessAvailability] | None,
+    ) -> Host | None:
+        """Refresh just a connected host's per-harness readiness map.
+
+        Called when a host sends a ``host.readiness`` frame mid-connection
+        (its ``PATH``-probed readiness changed since connect). Updates only
+        ``configured_harnesses`` and ``updated_at`` — never ``owner`` /
+        ``name`` / ``status`` — so it can't disturb ownership or liveness.
+        A no-op returning ``None`` when the host row is absent (e.g. it was
+        removed while connected).
+
+        :param host_id: Stable host identifier, e.g. ``"host_a1b2c3d4..."``.
+        :param configured_harnesses: Fresh readiness map, same shape as
+            :meth:`upsert_on_connect`'s parameter.
+        :returns: The updated :class:`Host`, or ``None`` if not found.
+        """
+        harnesses_json = (
+            json.dumps(configured_harnesses) if configured_harnesses is not None else None
+        )
+        with self._session() as session:
+            row = session.get(SqlHost, (current_workspace_id(), host_id))
+            if row is None:
+                return None
+            row.configured_harnesses = harnesses_json
+            row.updated_at = now_epoch()
+            return _row_to_host(row)
+
     @staticmethod
     def _rotate_host_id(
         session: Session,
